@@ -1,0 +1,165 @@
+# ---------------------------------------------------------------
+# Cellpose  ➔  keep top-20 % large cells  ➔  circle touching groups
+# ---------------------------------------------------------------
+
+import os, re, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from skimage.io         import imread, imsave
+from skimage.filters    import gaussian
+from skimage.measure    import regionprops, label
+from matplotlib.colors  import Normalize
+from matplotlib.patches import Circle
+from matplotlib         import cm
+from cellpose           import models
+
+# ────────────────────── 1. user input ─────────────────────────
+image_size_input = input("Enter image size (e.g. 512x512): ")
+scale_bar        = float(input("Enter μm per pixel: "))
+
+# ────────────────────── 2. paths ──────────────────────────────
+dapi_folder    = '/Users/baharehbahmani/Desktop/LAB/3D/Edit/WT Maturation media_1/C1'
+actinin_folder = '/Users/baharehbahmani/Desktop/LAB/3D/Edit/WT Maturation media_1/C2'
+result_folder  = '/Users/baharehbahmani/Desktop/LAB/3D/Edit/WT Maturation media_1/Result1330order'
+os.makedirs(result_folder, exist_ok=True)
+
+# ────────────────────── 3. file index matching ────────────────
+dapi_dict, act_dict = {}, {}
+for f in os.listdir(dapi_folder):
+    m = re.match(r'^C1_(\d+)\.tif$', f)
+    if m: dapi_dict[int(m.group(1))] = f
+for f in os.listdir(actinin_folder):
+    m = re.match(r'^C2_(\d+)\.tif$', f)
+    if m: act_dict[int(m.group(1))] = f
+
+indices = sorted(set(dapi_dict) & set(act_dict))
+print(f"Found {len(indices)} matching image pairs.")
+
+# ────────────────────── 4. load Cellpose ──────────────────────
+model = models.Cellpose(gpu=False, model_type='cyto2')
+
+# tables to fill
+cell_rows    : list[list] = []
+cluster_rows : list[list] = []
+
+# ────────────────────── 5. main loop ──────────────────────────
+for idx in indices:
+    print(f"\n▶  Processing pair {idx}")
+
+    # 5-1  read + pre-process
+    dapi    = imread(os.path.join(dapi_folder,    dapi_dict[idx])).astype(np.float32)
+    actinin = imread(os.path.join(actinin_folder, act_dict[idx])).astype(np.float32)
+    if dapi.max():    dapi    /= dapi.max()
+    if actinin.max(): actinin /= actinin.max()
+    actinin = gaussian(actinin, 1.0)
+    img2ch  = np.stack([actinin, dapi], -1)
+
+    # 5-2  Cellpose
+    masks, *_ = model.eval([img2ch], channels=[1, 2], diameter=330,
+                            flow_threshold=0.4, cellprob_threshold=0.0)
+    mask = masks[0]
+
+    # remove debris <1000 px
+    for rp in regionprops(mask):
+        if rp.area < 1000:
+            mask[tuple(rp.coords.T)] = 0
+    mask = label(mask)
+
+    # relabel ascending by area
+    props_sorted = sorted(regionprops(mask), key=lambda r: r.area)
+    rel = np.zeros_like(mask, np.uint16)
+    for new_lbl, rp in enumerate(props_sorted, 1):
+        rel[tuple(rp.coords.T)] = new_lbl
+    mask = rel
+    props = regionprops(mask)
+
+    imsave(os.path.join(result_folder, f"mask_{dapi_dict[idx]}"), mask.astype(np.uint16))
+
+    # 5-3  heatmap of *all* cells
+    norm  = Normalize(1, mask.max()) if mask.max() else Normalize(0,1)
+    color = (cm.nipy_spectral(norm(mask))[:, :, :3]*255).astype(np.uint8)
+    fig, ax = plt.subplots(figsize=(10,8))
+    ax.imshow(color)
+    for rp in props:
+        y,x = rp.centroid
+        ax.text(x, y, rp.label, color='white', fontsize=6, ha='center', va='center')
+    sm = plt.cm.ScalarMappable(cmap='nipy_spectral', norm=norm)
+    cbar = fig.colorbar(sm, ax=ax, fraction=.046, pad=.04)
+    cbar.set_label('Cell area order (small→large)')
+    ax.set_title(f"All cells – idx {idx}")
+    ax.axis('off')
+    fn_heat = os.path.join(result_folder, f"Mask-Color-Labels-{idx}.png")
+    fig.savefig(fn_heat, dpi=300)
+    plt.show(block=False); plt.pause(0.1); plt.close(fig)
+
+    # 5-4  pick large cells (top-30 %)
+    areas  = np.array([rp.area for rp in props])
+    thr_A  = np.quantile(areas, 0.70)
+    bigLab = [rp.label for rp in props if rp.area >= thr_A]
+
+    big_bin = np.isin(mask, bigLab)
+    big_rgb = np.zeros((*mask.shape,3), np.uint8)
+    big_rgb[big_bin] = (255,0,0)
+
+    # 5-5  clusters of touching large cells
+    touch = []
+    cluster_lbl = label(big_bin, connectivity=2)
+    for cl in regionprops(cluster_lbl):
+        member = np.unique(mask[cluster_lbl == cl.label])
+        member = member[member>0]
+        if len(member) > 1:
+            touch.append((cl, member))
+            cluster_rows.append([idx, len(touch), len(member),
+                                 ";".join(map(str, member))])
+
+    print(f"   → {len(touch)} touching clusters.")
+
+    # 5-6  plot clusters
+    fig, ax = plt.subplots(figsize=(10,8))
+    ax.imshow(big_rgb)
+    # white labels on every large cell
+    for rp in props:
+        if rp.label in bigLab:
+            y,x = rp.centroid
+            ax.text(x, y, rp.label, color='white', fontsize=7,
+                    ha='center', va='center')
+    # yellow circle per touching cluster
+    for cl,_ in touch:
+        y,x = cl.centroid
+        r   = cl.equivalent_diameter/2
+        ax.add_patch(Circle((x,y), r, edgecolor='yellow',
+                            facecolor='none', lw=2))
+    ax.axis('off')
+    ax.set_title(f"Touching clusters – idx {idx}")
+    fn_touch = os.path.join(result_folder, f"Touching-Large-Clusters-{idx}.png")
+    fig.savefig(fn_touch, dpi=300)
+    plt.show(block=False); plt.pause(0.1); plt.close(fig)
+
+    # 5-7  append per-cell table
+    for rp in props:
+        peri  = rp.perimeter
+        circ  = 4*np.pi*rp.area/(peri**2) if peri else 0
+        y,x   = rp.centroid
+        cell_rows.append([idx, rp.label, rp.area,
+                          rp.major_axis_length/rp.minor_axis_length if rp.minor_axis_length else 0,
+                          rp.eccentricity, circ,
+                          x, y, rp.area*(scale_bar**2),
+                          image_size_input, scale_bar])
+
+# ────────────────────── 6. write CSVs ─────────────────────────
+cells_df = pd.DataFrame(cell_rows, columns=[
+    'Image_Index','Cell_ID','Area_pix','Elongation','Eccentricity','Circularity',
+    'Centroid_X','Centroid_Y','Area_μm²','image_size_input','scale_bar'])
+cells_df.to_csv(os.path.join(result_folder,'cell_measurements.csv'), index=False)
+
+clusters_df = pd.DataFrame(cluster_rows, columns=[
+    'Image_Index','Cluster_ID','N_cells','Cell_Labels','Area_pix','Elongation','Eccentricity','Circularity','Area_μm²'])
+clusters_df.to_csv(os.path.join(result_folder,'large_cell_clusters_detailed.csv'), index=False)
+
+print("\n✓ Done.")
+print("  • cell_measurements.csv")
+print("  • large_cell_clusters_detailed.csv")
+print("  Images & overlays saved in:", result_folder)
+
+
+
+
+
